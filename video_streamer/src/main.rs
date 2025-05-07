@@ -1,7 +1,10 @@
+use chrono::Utc;
 use once_cell::sync::Lazy;
-use opencv::core::Point;
+use opencv::core::{Point, Vector};
 use opencv::prelude::*;
-use opencv::{highgui, videoio, Result};
+use opencv::{highgui, imgcodecs, videoio, Result};
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -103,6 +106,7 @@ impl State {
     }
 }
 
+#[allow(dead_code)]
 fn pretty_print(actions: &mut Vec<MouseAction>) {
     // Empty the buffer so we don't re-print old events on the next frame
     for act in actions.drain(..) {
@@ -126,6 +130,11 @@ fn with_context<R>(f: impl FnOnce(&mut State, &mut Vec<MouseAction>) -> R) -> R 
     f(&mut st, &mut actions)
 }
 
+fn get_frame_id() -> usize {
+    static COUNTER: AtomicUsize = AtomicUsize::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 fn main() -> Result<()> {
     let window = "Video Capture";
     highgui::named_window(window, highgui::WINDOW_AUTOSIZE)?;
@@ -143,6 +152,13 @@ fn main() -> Result<()> {
     });
     highgui::set_mouse_callback(window, Some(mouse_callback))?;
 
+    // Prepare context and publisher
+    let context = zmq::Context::new();
+    let publisher = context.socket(zmq::PUB).unwrap();
+    publisher
+        .bind("tcp://*:5563")
+        .expect("failed binding publisher");
+
     loop {
         let mut frame = Mat::default();
         cam.read(&mut frame)?;
@@ -156,13 +172,63 @@ fn main() -> Result<()> {
             break;
         }
 
-        with_context(|st, actions| {
+        // Extract mouse actions for publishing
+        let new_actions: Vec<MouseAction> = with_context(|st, actions| {
             // Flushing a stale pending click ensures when no second click happens in time,
             // the main loop notices the timeout, emits one SingleClick, and clears the pending.
             st.flush_pending(actions);
-            pretty_print(actions);
-            actions.clear();
+            let taken = actions.drain(..).collect();
+            taken
         });
+        let action_info = if let Some(action) = new_actions.last() {
+            match action {
+                MouseAction::SingleClick(pt) => {
+                    json!({ "type": "single_click", "coords": [pt.x, pt.y] })
+                }
+                MouseAction::DoubleClick(pt) => {
+                    json!({"type": "double_click", "coords": [pt.x, pt.y] })
+                }
+                MouseAction::DrawBox(p1, p2) => {
+                    json!({"type": "draw_box", "coords": [[p1.x,p1.y],[p2.x,p2.y]] })
+                }
+            }
+        } else {
+            serde_json::Value::Null
+        };
+
+        // Publish video frames
+        let mut buf = Vector::<u8>::new();
+        imgcodecs::imencode(".jpg", &frame, &mut buf, &Vector::new())?;
+        let payload_bytes: &[u8] = buf.as_slice();
+
+        let metadata = json!({
+            "frame_id": get_frame_id(),
+            "height":   frame.rows(),
+            "width":    frame.cols(),
+            "channels": frame.channels(),
+            "frame_size_bytes": payload_bytes.len(),
+            "action": action_info,
+            "timestamp": Utc::now().timestamp_millis(),
+        })
+        .to_string();
+
+        // Get size of the compressed JPEG image
+        let size_bytes = buf.len();
+        let size_kb = size_bytes as f64 / 1024.0;
+
+        if size_kb < 200.0 {
+            println!("under 200 KB ({} KB)", size_kb);
+        } else {
+            println!("{} KB—consider re-encoding at lower quality", size_kb);
+        }
+
+        // [metadata][jpeg_bytes]
+        publisher
+            .send(&metadata, zmq::SNDMORE)
+            .expect("failed to send metadata");
+        publisher
+            .send(payload_bytes, 0)
+            .expect("failed to send payload");
     }
     Ok(())
 }
