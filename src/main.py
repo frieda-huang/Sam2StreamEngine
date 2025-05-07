@@ -89,40 +89,82 @@ def handle(action: Optional[Action]) -> Prompts:
     return action_name, coords, label
 
 
+"""
+We want to make propagation actually see "future" frames.
+We need to accumulate a sliding window of frames in `inference_state`, 
+then tell SAM2 to propagate from the prompt frame onward through that window
+
+    > On each new frame, we append into the buffer tensor of shape (T, 3, H, W)
+    > When we get a click/box prompt on the current frame at local index T-1, we call `add_new_points_or_box`
+    > We propagate through all later frames in the buffer
+
+    For example:
+
+    1. At t0, we recieve f0 -> buffer[f0] -> prompt on f0 (prompt_idx=0) -> no propagation yet
+    2. At t1, we receive f1 -> buffer[f0,f1] -> prompt remains at prompt_idx=0 -> propagate yields mask for i=1 (f1)
+    ...
+
+        Time            t0          t1          t2          t3
+        Frames          f0          f1          f2          f3 
+        Buffer idxes    b0          b1          b2          b3
+        Prompt on       [f0]        [f0,f1]     [f0,f1,f2]  [f0,f1,f2,f3]
+        Propagate       -           i=1         i=1,i=2     i=1,i=2,i=3
+"""
+
+
 def consumer_loop(sub: Socket):
-    metadata_bytes, jpg_bytes = sub.recv_multipart()
-    metadata = FrameMetadata.model_validate_json(metadata_bytes.decode("utf-8"))
-    inference_state = predictor.init_state(
-        video_height=metadata.height, video_width=metadata.width
-    )
+    inference_state = None
 
     while True:
         try:
+            # We receive one video frame in `jpg_bytes` at a time along with its metadata
             metadata_bytes, jpg_bytes = sub.recv_multipart()
-            metadata = FrameMetadata.model_validate_json(metadata_bytes.decode("utf-8"))
+            metadata = FrameMetadata.model_validate_json(
+                metadata_bytes.decode("utf-8"),
+            )
+
+            if inference_state is None:
+                inference_state = predictor.init_state(
+                    video_height=metadata.height, video_width=metadata.width
+                )
+
             predictor.update_state_with_frame(inference_state, jpg_bytes)
 
             result = handle(metadata.action)
             if result is None:
                 continue
 
-            frame_idx = metadata.frame_id
             obj_id = uuid.uuid4()
-
             _, coords, labels = result
 
+            prompt_idx = inference_state["num_frames"] - 1
             event = Event(
                 inference_state=inference_state,
                 points=coords,
                 labels=labels,
-                frame_idx=frame_idx,
+                frame_idx=prompt_idx,
                 obj_id=obj_id,
             )
 
             out_mask_logits, out_obj_ids = add_points(event)
 
-            print(out_mask_logits)
-            print(out_obj_ids)
+            # Video_segments contains the per-frame segmentation results
+            video_segments = {}
+            for (
+                out_frame_idx,
+                out_obj_ids,
+                out_mask_logits,
+            ) in predictor.propagate_in_video(
+                inference_state,
+                start_frame_idx=prompt_idx,
+                max_frame_num_to_track=10,
+                reverse=False,
+            ):
+                print(out_frame_idx, out_obj_ids, out_mask_logits)
+                video_segments[out_frame_idx] = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
 
         except ValidationError as e:
             print("Bad metadata JSON:", e)

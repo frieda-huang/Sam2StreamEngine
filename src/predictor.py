@@ -135,11 +135,8 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
     ) -> dict:
         compute_device = self.device  # device of the model
         inference_state = {}
-        inference_state["images"] = None
-
-        inference_state["num_frames"] = (
-            len(inference_state["images"]) if inference_state["images"] else 0
-        )
+        inference_state["images"] = torch.empty(0, 3, self.image_size, self.image_size)
+        inference_state["num_frames"] = 0
 
         # whether to offload the video frames to CPU memory
         # turning on this option saves the GPU memory with only a very small overhead
@@ -182,11 +179,14 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
         return inference_state
 
     def update_state_with_frame(self, inference_state: dict, jpg_bytes: bytes) -> None:
-        images = preprocess_frame_from_bytes(
+        image_tensor = preprocess_frame_from_bytes(
             jpg_bytes,
             image_size=self.image_size,
         )
-        inference_state["images"] = images
+
+        buf = inference_state["images"].to(self.device)
+        inference_state["images"] = torch.cat([buf, image_tensor], dim=0)
+        inference_state["num_frames"] = inference_state["images"].shape[0]
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """Compute the image features on a given frame."""
@@ -201,11 +201,10 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
             # We use frame_idx = 0 since `images` is of the shape (1, 3, H, W) when streaming the video
             image = inference_state["images"][0].to(device).float().unsqueeze(0)
             backbone_out = self.forward_image(image)
-            # Cache the most recent frame's feature (for repeated interactions with
-            # a frame; we can use an LRU cache for more frames in the future).
-            inference_state["cached_features"] = {frame_idx: (image, backbone_out)}
+            # TODO: we can use an LRU cache for more frames in the future.
+            inference_state["cached_features"][frame_idx] = (image, backbone_out)
 
-        # expand the features to have the same dimension as the number of objects
+        # Expand the features to have the same dimension as the number of objects
         expanded_image = image.expand(batch_size, -1, -1, -1)
         expanded_backbone_out = {
             "backbone_fpn": backbone_out["backbone_fpn"].copy(),
