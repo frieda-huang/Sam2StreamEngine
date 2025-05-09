@@ -1,5 +1,4 @@
 import logging
-import uuid
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -45,18 +44,19 @@ def create_subscriber(endpoint: str = "tcp://127.0.0.1:5563") -> Tuple[Context, 
 
 
 def add_points(event: Event) -> Tuple[list, Dict[str, torch.Tensor]]:
-    points = np.array([event.points], dtype=np.float32)
-    labels = np.array([event.labels], np.int32)
+    with torch.inference_mode(), torch.autocast("mps", dtype=torch.bfloat16):
+        points = np.array([event.points], dtype=np.float32)
+        labels = np.array([event.labels], np.int32)
 
-    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-        inference_state=event.inference_state,
-        frame_idx=event.frame_idx,
-        obj_id=event.obj_id,
-        points=points,
-        labels=labels,
-    )
+        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+            inference_state=event.inference_state,
+            frame_idx=event.frame_idx,
+            obj_id=event.obj_id,
+            points=points,
+            labels=labels,
+        )
 
-    return out_obj_ids, out_mask_logits
+        return out_obj_ids, out_mask_logits
 
 
 def handle(action: Optional[Action]) -> Prompts:
@@ -102,6 +102,7 @@ then tell SAM2 to propagate from the prompt frame onward through that window
 
     1. At t0, we recieve f0 -> buffer[f0] -> prompt on f0 (prompt_idx=0) -> no propagation yet
     2. At t1, we receive f1 -> buffer[f0,f1] -> prompt remains at prompt_idx=0 -> propagate yields mask for i=1 (f1)
+    3. If we prompt again on f2, update prompt_idx=2 and then propagate into frames f3, f4, ...
     ...
 
         Time            t0          t1          t2          t3
@@ -113,62 +114,109 @@ then tell SAM2 to propagate from the prompt frame onward through that window
 
 
 def consumer_loop(sub: Socket):
+    obj_id = 0
     inference_state = None
+    prompt_idx = -1
+    buffer_size = 10
 
     while True:
         try:
-            # We receive one video frame in `jpg_bytes` at a time along with its metadata
-            metadata_bytes, jpg_bytes = sub.recv_multipart()
-            metadata = FrameMetadata.model_validate_json(
-                metadata_bytes.decode("utf-8"),
-            )
-
-            if inference_state is None:
-                inference_state = predictor.init_state(
-                    video_height=metadata.height, video_width=metadata.width
+            with torch.inference_mode(), torch.autocast("mps", dtype=torch.bfloat16):
+                # We receive one video frame at a time in `jpg_bytes` along with its metadata
+                metadata_bytes, jpg_bytes = sub.recv_multipart()
+                metadata = FrameMetadata.model_validate_json(
+                    metadata_bytes.decode("utf-8"),
                 )
 
-            predictor.update_state_with_frame(inference_state, jpg_bytes)
+                if inference_state is None:
+                    inference_state = predictor.init_state(
+                        video_height=metadata.height, video_width=metadata.width
+                    )
 
-            result = handle(metadata.action)
-            if result is None:
-                continue
+                # Always concatenate new frame to existing frames frist
+                # We trim later to fit into `buffer_size`
+                predictor.update_state_with_frame(inference_state, jpg_bytes)
 
-            obj_id = uuid.uuid4()
-            _, coords, labels = result
+                result = handle(metadata.action)
 
-            prompt_idx = inference_state["num_frames"] - 1
-            event = Event(
-                inference_state=inference_state,
-                points=coords,
-                labels=labels,
-                frame_idx=prompt_idx,
-                obj_id=obj_id,
-            )
+                # On click -> Seed SAM2
+                if result is not None:
+                    _, coords, labels = result
 
-            out_mask_logits, out_obj_ids = add_points(event)
+                    # As we just appended the frame, we get its index `prompt_idx` at n - 1
+                    # where n is the total number of frames so far
+                    prompt_idx = inference_state["num_frames"] - 1
 
-            # Video_segments contains the per-frame segmentation results
-            video_segments = {}
-            for (
-                out_frame_idx,
-                out_obj_ids,
-                out_mask_logits,
-            ) in predictor.propagate_in_video(
-                inference_state,
-                start_frame_idx=prompt_idx,
-                max_frame_num_to_track=10,
-                reverse=False,
-            ):
-                print(out_frame_idx, out_obj_ids, out_mask_logits)
-                video_segments[out_frame_idx] = {
-                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                    for i, out_obj_id in enumerate(out_obj_ids)
-                }
+                    event = Event(
+                        inference_state=inference_state,
+                        points=coords,
+                        labels=labels,
+                        frame_idx=prompt_idx,
+                        obj_id=obj_id,
+                    )
+
+                    # Add click/box to the current frame
+                    out_obj_ids, out_mask_logits = add_points(event)
+                    inference_state["obj_ids"].append(obj_id)
+                    print("hello", inference_state["obj_ids"])
+                    obj_id += 1  # Unique id; could be any integers
+
+                    # Discard all frames preceding the prompt
+                    # We'll use the current prompt frame as the base state to propagate through all future frames
+                    images = inference_state["images"]
+                    inference_state["images"] = images[prompt_idx:]
+                    inference_state["num_frames"] = 1
+                    prompt_idx = 0
+
+                # Always try to propagate if we have at least one frame beyond last prompt
+                # For example, if num_frames=5, frame_idx=4, prompt_idx=4,
+                # we wouldn't propagate as we are already at buffer's last index
+                # However, num_frames=5, frame_idx=4, prompt_idx=3 works because 5 > 3 + 1
+                if prompt_idx >= 0 and inference_state["num_frames"] > prompt_idx + 1:
+                    # `video_segments` contains the per-frame segmentation results
+                    video_segments = {}
+                    for (
+                        out_frame_idx,
+                        out_obj_ids,
+                        out_mask_logits,
+                    ) in predictor.propagate_in_video(
+                        inference_state,
+                        start_frame_idx=prompt_idx,
+                        max_frame_num_to_track=buffer_size,
+                        reverse=False,  # Real-time video capturing only goes forward
+                    ):
+                        print("===(out_frame_idx, out_obj_ids, out_mask_logits)===")
+                        print(out_frame_idx, out_obj_ids, out_mask_logits)
+                        print("===(out_frame_idx, out_obj_ids, out_mask_logits)===")
+
+                        video_segments[out_frame_idx] = {
+                            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+                            for i, out_obj_id in enumerate(out_obj_ids)
+                        }
+
+                    print()
+                    print("Video Segments >", video_segments)
+                    print()
+
+                # When no prompt has been received recently or at all
+                if inference_state["num_frames"] > buffer_size:
+                    # If we never received a prompt, we can safely trim it to only keep the latest frame
+                    if prompt_idx == -1:
+                        predictor.reset_images(inference_state)
+                    else:
+                        # Pull out the latest prompt frame as a (C, H, W) tensor
+                        image = inference_state["images"][prompt_idx]
+                        image = image.unsqueeze(0)  # Reshape to (1, C, H, W)
+
+                        inference_state["images"] = image
+                        inference_state["num_frames"] = 1
 
         except ValidationError as e:
             print("Bad metadata JSON:", e)
         except Exception as e:
+            import traceback
+
+            traceback.print_exc()
             print("Unexpected error in consumer_loop:", e)
             continue
 

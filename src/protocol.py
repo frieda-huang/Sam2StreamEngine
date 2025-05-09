@@ -1,5 +1,4 @@
 from typing import Dict, Literal, Optional, Tuple, Union
-from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -28,7 +27,7 @@ class Event(BaseModel):
     points: "ActionCoords"
     labels: "Labels"
     frame_idx: int
-    obj_id: UUID
+    obj_id: int
 
 
 Action = Union[SingleClick, DoubleClick, DrawBox]

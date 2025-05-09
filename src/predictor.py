@@ -18,7 +18,7 @@ if not GlobalHydra.instance().is_initialized():
 
 def _load_checkpoint(model, ckpt_path):
     if ckpt_path is not None:
-        sd = torch.load(ckpt_path, map_location="cpu", weights_only=True)["model"]
+        sd = torch.load(ckpt_path, map_location="mps", weights_only=True)["model"]
         missing_keys, unexpected_keys = model.load_state_dict(sd)
         if missing_keys:
             logging.error(missing_keys)
@@ -51,13 +51,13 @@ def build_sam2_video_predictor(
     if apply_postprocessing:
         hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [
-            # dynamically fall back to multi-mask if the single mask is not stable
+            # Dynamically fall back to multi-mask if the single mask is not stable
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=true",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_delta=0.05",
             "++model.sam_mask_decoder_extra_args.dynamic_multimask_stability_thresh=0.98",
-            # the sigmoid mask logits on interacted frames with clicks in the memory encoder so that the encoded masks are exactly as what users see from clicking
+            # The sigmoid mask logits on interacted frames with clicks in the memory encoder so that the encoded masks are exactly as what users see from clicking
             "++model.binarize_mask_from_pts_for_mem_enc=true",
-            # fill small holes in the low-res masks up to `fill_hole_area` (before resizing them to the original video resolution)
+            # Fill small holes in the low-res masks up to `fill_hole_area` (before resizing them to the original video resolution)
             "++model.fill_hole_area=8",
         ]
     hydra_overrides.extend(hydra_overrides_extra)
@@ -106,7 +106,7 @@ def preprocess_frame_from_bytes(
     std = img_std.view(1, -1, 1, 1)
     tensor = (tensor - mean) / std
 
-    return tensor.to(compute_device)
+    return tensor.to(compute_device, dtype=torch.bfloat16)
 
 
 class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
@@ -126,6 +126,9 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
             **kwargs,
         )
 
+    def reset_images(self, inference_state: dict):
+        inference_state["images"] = torch.empty(0, 3, self.image_size, self.image_size)
+
     def init_state(
         self,
         video_height: int,
@@ -133,20 +136,20 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
         offload_video_to_cpu=False,
         offload_state_to_cpu=False,
     ) -> dict:
-        compute_device = self.device  # device of the model
+        compute_device = self.device  # Device of the model
         inference_state = {}
-        inference_state["images"] = torch.empty(0, 3, self.image_size, self.image_size)
+        self.reset_images(inference_state)
         inference_state["num_frames"] = 0
 
-        # whether to offload the video frames to CPU memory
-        # turning on this option saves the GPU memory with only a very small overhead
+        # Whether to offload the video frames to CPU memory
+        # Turning on this option saves the GPU memory with only a very small overhead
         inference_state["offload_video_to_cpu"] = offload_video_to_cpu
-        # whether to offload the inference state to CPU memory
-        # turning on this option saves the GPU memory at the cost of a lower tracking fps
+        # Whether to offload the inference state to CPU memory
+        # Turning on this option saves the GPU memory at the cost of a lower tracking fps
         # (e.g. in a test case of 768x768 model, fps dropped from 27 to 24 when tracking one object
         # and from 24 to 21 when tracking two objects)
         inference_state["offload_state_to_cpu"] = offload_state_to_cpu
-        # the original video height and width, used for resizing final output scores
+        # The original video height and width, used for resizing final output scores
         inference_state["video_height"] = video_height
         inference_state["video_width"] = video_width
         inference_state["device"] = compute_device
@@ -154,14 +157,14 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
             inference_state["storage_device"] = torch.device("cpu")
         else:
             inference_state["storage_device"] = compute_device
-        # inputs on each frame
+        # Inputs on each frame
         inference_state["point_inputs_per_obj"] = {}
         inference_state["mask_inputs_per_obj"] = {}
-        # visual features on a small number of recently visited frames for quick interactions
+        # Visual features on a small number of recently visited frames for quick interactions
         inference_state["cached_features"] = {}
-        # values that don't change across frames (so we only need to hold one copy of them)
+        # Values that don't change across frames (so we only need to hold one copy of them)
         inference_state["constants"] = {}
-        # mapping between client-side object id and model-side object index
+        # Mapping between client-side object id and model-side object index
         inference_state["obj_id_to_idx"] = OrderedDict()
         inference_state["obj_idx_to_id"] = OrderedDict()
         inference_state["obj_ids"] = []
@@ -178,13 +181,18 @@ class SAM2VideoStreamingPredictor(SAM2VideoPredictor):
         # self._get_image_feature(inference_state, frame_idx=0, batch_size=1)
         return inference_state
 
-    def update_state_with_frame(self, inference_state: dict, jpg_bytes: bytes) -> None:
+    def update_state_with_frame(
+        self,
+        inference_state: dict,
+        jpg_bytes: bytes,
+    ) -> None:
         image_tensor = preprocess_frame_from_bytes(
             jpg_bytes,
             image_size=self.image_size,
         )
 
         buf = inference_state["images"].to(self.device)
+
         inference_state["images"] = torch.cat([buf, image_tensor], dim=0)
         inference_state["num_frames"] = inference_state["images"].shape[0]
 
