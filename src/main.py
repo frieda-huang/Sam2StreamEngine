@@ -191,18 +191,14 @@ def consumer_loop(sub: Socket):
                         max_frame_num_to_track=buffer_size,
                         reverse=False,  # Real-time video capturing only goes forward
                     ):
-                        print("===(out_frame_idx, out_obj_ids, out_mask_logits)===")
                         print(out_frame_idx, out_obj_ids, out_mask_logits)
-                        print("===(out_frame_idx, out_obj_ids, out_mask_logits)===")
 
                         video_segments[out_frame_idx] = {
                             out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
                             for i, out_obj_id in enumerate(out_obj_ids)
                         }
 
-                    print()
                     print("Video Segments >", video_segments)
-                    print()
 
                     # TODO: Move this to rust
                     import cv2
@@ -213,7 +209,7 @@ def consumer_loop(sub: Socket):
                         img = cv2.imdecode(
                             np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR
                         )
-                        # Get binary mask from the logits
+                        # Get binary mask from the logits; `out_mask_logits` has shape (1, num_objs, H, W)
                         mask = (out_mask_logits[0, 0] > 0).cpu().numpy()  # H×W bool
 
                         # If the model works at a different resolution than the camera, resize:
