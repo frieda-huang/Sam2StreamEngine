@@ -23,3 +23,7 @@ python main.py
 ## Limitations
 
 Currently, video freezes after the first 2 clicks despite successfully generating the green mask.
+
+## Progress
+
+-   [live demo #1](https://x.com/JYFHuang/status/1921794553117360574)
