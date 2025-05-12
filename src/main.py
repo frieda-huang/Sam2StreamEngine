@@ -43,10 +43,10 @@ def create_subscriber(endpoint: str = "tcp://127.0.0.1:5563") -> Tuple[Context, 
     return ctx, sub
 
 
-def add_points(event: Event) -> Tuple[list, Dict[str, torch.Tensor]]:
+def add_points(event: Event, clear_pts: bool) -> Tuple[list, Dict[str, torch.Tensor]]:
     with torch.inference_mode(), torch.autocast("mps", dtype=torch.bfloat16):
         points = np.array([event.points], dtype=np.float32)
-        labels = np.array([event.labels], np.int32)
+        labels = np.array([event.labels], dtype=np.int32)
 
         _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
             inference_state=event.inference_state,
@@ -54,6 +54,7 @@ def add_points(event: Event) -> Tuple[list, Dict[str, torch.Tensor]]:
             obj_id=event.obj_id,
             points=points,
             labels=labels,
+            clear_old_points=clear_pts,
         )
 
         return out_obj_ids, out_mask_logits
@@ -114,7 +115,14 @@ then tell SAM2 to propagate from the prompt frame onward through that window
 
 
 def consumer_loop(sub: Socket):
-    obj_id = 0
+    # Track the first click for a given `obj_id`
+    # We need to know whether this is the first click for a given `obj_id` (so we clear old points)
+    # or a refinement click (so we merge points)
+    # Every time we finish one object's propagation and clear buffer, we call `click_counts.clear()`
+    # to reset the counter so our next click starts a brand-new object (obj_id=0 again)
+    # Without it, we wouldn't be able to group clicks into separate "objects" versus "refinements on the same object"
+    click_counts: Dict[int, int] = {}
+
     inference_state = None
     prompt_idx = -1
     buffer_size = 10
@@ -137,15 +145,22 @@ def consumer_loop(sub: Socket):
                 # We trim later to fit into `buffer_size`
                 predictor.update_state_with_frame(inference_state, jpg_bytes)
 
-                result = handle(metadata.action)
+                prompt = handle(metadata.action)
 
                 # On click -> Seed SAM2
-                if result is not None:
-                    _, coords, labels = result
+                if prompt is not None:
+                    _, coords, labels = prompt
 
                     # As we just appended the frame, we get its index `prompt_idx` at n - 1
                     # where n is the total number of frames so far
                     prompt_idx = inference_state["num_frames"] - 1
+
+                    obj_id = len(click_counts)
+                    click_counts.setdefault(obj_id, 0)
+
+                    # Clear previous points on first click
+                    clear_pts = click_counts[obj_id] == 0
+                    click_counts[obj_id] += 1
 
                     event = Event(
                         inference_state=inference_state,
@@ -156,17 +171,8 @@ def consumer_loop(sub: Socket):
                     )
 
                     # Add click/box to the current frame
-                    out_obj_ids, out_mask_logits = add_points(event)
-                    inference_state["obj_ids"].append(obj_id)
-                    print("hello", inference_state["obj_ids"])
-                    obj_id += 1  # Unique id; could be any integers
-
-                    # Discard all frames preceding the prompt
-                    # We'll use the current prompt frame as the base state to propagate through all future frames
-                    images = inference_state["images"]
-                    inference_state["images"] = images[prompt_idx:]
-                    inference_state["num_frames"] = 1
-                    prompt_idx = 0
+                    out_obj_ids, out_mask_logits = add_points(event, clear_pts)
+                    inference_state["obj_ids"] = out_obj_ids.copy()
 
                 # Always try to propagate if we have at least one frame beyond last prompt
                 # For example, if num_frames=5, frame_idx=4, prompt_idx=4,
@@ -198,18 +204,45 @@ def consumer_loop(sub: Socket):
                     print("Video Segments >", video_segments)
                     print()
 
-                # When no prompt has been received recently or at all
-                if inference_state["num_frames"] > buffer_size:
-                    # If we never received a prompt, we can safely trim it to only keep the latest frame
-                    if prompt_idx == -1:
-                        predictor.reset_images(inference_state)
-                    else:
-                        # Pull out the latest prompt frame as a (C, H, W) tensor
-                        image = inference_state["images"][prompt_idx]
-                        image = image.unsqueeze(0)  # Reshape to (1, C, H, W)
+                    # TODO: Move this to rust
+                    import cv2
 
-                        inference_state["images"] = image
-                        inference_state["num_frames"] = 1
+                    # Right after the `propagate_in_video` loop:
+                    if out_frame_idx == inference_state["num_frames"] - 1:
+                        # Decode the same `jpg_bytes` we just recv’d
+                        img = cv2.imdecode(
+                            np.frombuffer(jpg_bytes, np.uint8), cv2.IMREAD_COLOR
+                        )
+                        # Get binary mask from the logits
+                        mask = (out_mask_logits[0, 0] > 0).cpu().numpy()  # H×W bool
+
+                        # If the model works at a different resolution than the camera, resize:
+                        mask_resized = cv2.resize(
+                            mask.astype(np.uint8),
+                            (img.shape[1], img.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+
+                        # Make a green overlay
+                        overlay = np.zeros_like(img)
+                        overlay[mask_resized == 1] = (0, 255, 0)
+
+                        # Blend and display
+                        blended = cv2.addWeighted(img, 0.7, overlay, 0.3, 0)
+                        cv2.imshow("segmented", blended)
+                        cv2.waitKey(1)
+
+                    # Discard all frames preceding the prompt
+                    # We'll use the current prompt frame as the base state to propagate through all future frames
+                    inference_state["images"] = inference_state["images"][prompt_idx:]
+                    inference_state["num_frames"] = inference_state["images"].shape[0]
+                    prompt_idx = 0
+
+                    click_counts.clear()
+
+                if inference_state["num_frames"] > buffer_size and prompt_idx == -1:
+                    # If we never received a prompt, we can safely trim it to only keep the latest frame
+                    predictor.reset_images(inference_state)
 
         except ValidationError as e:
             print("Bad metadata JSON:", e)
